@@ -42,6 +42,68 @@ We consider a sensing node that, at discrete time instants $t$, computes a PSD e
 the discretized PSD sampled on a uniform frequency grid $\{\omega_n\}_{n=1}^N$ covering the monitored band. The node must transmit a compressed description of $\mathbf{S}_t$ to a cloud service under a bitrate budget, where the cloud reconstructs $\hat{\mathbf{S}}_t$ and performs spectrum-sensing analytics.
 
 \vspace{2mm}
+
+\subsection{Sensing-driven quantities derived from the PSD}
+The remote monitor uses the reconstructed PSD to derive spectrum-sensing quantities relevant to FM monitoring. Typical examples include:
+\begin{align}
+\omega_{\mathrm{pk}} &\triangleq \arg\max_{\omega} S_t(\omega) && \text{(peak/candidate carrier)} \\
+\omega_{\mathrm{cent}} &\triangleq \frac{\sum_{n=1}^{N}\omega_n S_t(\omega_n)}{\sum_{n=1}^{N} S_t(\omega_n)} && \text{(spectral centroid)}.
+\end{align}
+Additionally, an occupancy map can be obtained by comparing the PSD to a (possibly frequency-dependent) noise-floor estimate $N_b(\omega)$ plus a margin $\gamma$:
+\begin{equation}
+O_t(\omega_n) \triangleq \mathbf{1}\{S_t(\omega_n) > N_b(\omega_n)+\gamma\}.
+\end{equation}
+Connected occupied regions define candidate emissions and may be used to estimate an occupied bandwidth $B_{\mathrm{occ}}$ (e.g., by thresholded support width or by a power-containment rule).
+
+\subsection{Bit budget and rate--distortion objective}
+Let $L_{b_s}(t)$ and $L_{b_t}(t)$ denote the number of bits used by the main bitstream and the side information, respectively. The total payload per PSD frame is
+\begin{equation}
+L_b(t) = L_{b_s}(t) + L_{b_t}(t).
+\end{equation}
+We seek to compress the PSD while preserving both waveform-level fidelity and sensing-level decisions derived from the PSD.
+
+A rate--distortion formulation is:
+\begin{equation}
+\min_{\theta,\Phi,\mathcal{E}} \; \mathbb{E}\big[\mathcal{D}(\mathbf{S}_t,\hat{\mathbf{S}}_t)\big]
+\quad \text{s.t.}\quad
+\mathbb{E}[L_b(t)] \le R_{\max},
+\end{equation}
+or equivalently the Lagrangian form:
+\begin{equation}
+\min_{\theta,\Phi,\mathcal{E}} \; \mathbb{E}\Big[\lambda\,\mathcal{D}(\mathbf{S}_t,\hat{\mathbf{S}}_t) + L_b(t)\Big],
+\end{equation}
+where $\lambda>0$ controls the rate--distortion trade-off.
+
+\subsection{Distortion tailored to spectrum sensing}
+Because the cloud ultimately performs sensing on $\hat{\mathbf{S}}_t$, we define $\mathcal{D}$ to penalize errors that matter for monitoring:
+\begin{enumerate}
+\item \textbf{PSD fidelity.} A normalized reconstruction error (often in log-PSD) such as
+\begin{equation}
+\mathcal{D}_{\mathrm{psd}} = \frac{1}{N}\sum_{n=1}^{N} \big(\psi(S_t(\omega_n))-\psi(\hat{S}_t(\omega_n))\big)^2,
+\end{equation}
+with $\psi(\cdot)$ an optional dynamic-range map (e.g., $\log(\epsilon+\cdot)$).
+
+\item \textbf{Occupancy consistency.} Let $O_t(\omega_n)$ and $\hat{O}_t(\omega_n)$ be computed from $S_t$ and $\hat{S}_t$ using the same noise-floor rule. Penalize mismatches, e.g., by a weighted binary cross-entropy (or FP/FN-weighted) loss across frequency bins.
+
+\item \textbf{Feature preservation.} Penalize deviations in sensing features such as peak and centroid:
+\begin{equation}
+\mathcal{D}_{\mathrm{feat}} =
+\alpha_{\mathrm{pk}}|\omega_{\mathrm{pk}}-\hat{\omega}_{\mathrm{pk}}|
++\alpha_{\mathrm{cent}}|\omega_{\mathrm{cent}}-\hat{\omega}_{\mathrm{cent}}|
++\alpha_{B}|B_{\mathrm{occ}}-\hat{B}_{\mathrm{occ}}|.
+\end{equation}
+\end{enumerate}
+A practical overall distortion is a weighted sum,
+\begin{equation}
+\mathcal{D} = \beta_{\mathrm{psd}}\mathcal{D}_{\mathrm{psd}} + \beta_{\mathrm{occ}}\mathcal{D}_{\mathrm{occ}} + \beta_{\mathrm{feat}}\mathcal{D}_{\mathrm{feat}}.
+\end{equation}
+
+
+\section{System model proposals}
+
+\subsection{Learned compression with a VQ-VAE}
+
+
 \begin{center}
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
@@ -132,19 +194,7 @@ the discretized PSD sampled on a uniform frequency grid $\{\omega_n\}_{n=1}^N$ c
 }
 \end{center}
 
-\subsection{Sensing-driven quantities derived from the PSD}
-The remote monitor uses the reconstructed PSD to derive spectrum-sensing quantities relevant to FM monitoring. Typical examples include:
-\begin{align}
-\omega_{\mathrm{pk}} &\triangleq \arg\max_{\omega} S_t(\omega) && \text{(peak/candidate carrier)} \\
-\omega_{\mathrm{cent}} &\triangleq \frac{\sum_{n=1}^{N}\omega_n S_t(\omega_n)}{\sum_{n=1}^{N} S_t(\omega_n)} && \text{(spectral centroid)}.
-\end{align}
-Additionally, an occupancy map can be obtained by comparing the PSD to a (possibly frequency-dependent) noise-floor estimate $N_b(\omega)$ plus a margin $\gamma$:
-\begin{equation}
-O_t(\omega_n) \triangleq \mathbf{1}\{S_t(\omega_n) > N_b(\omega_n)+\gamma\}.
-\end{equation}
-Connected occupied regions define candidate emissions and may be used to estimate an occupied bandwidth $B_{\mathrm{occ}}$ (e.g., by thresholded support width or by a power-containment rule).
-
-\subsection{PSD compression pipeline (VQ-VAE system model)}
+\subsubsection{Compression pipeline}
 For each PSD frame $\mathbf{S}_t$, the sensing node applies a deterministic pre-/post-processing chain and a learned VQ-VAE bottleneck.
 
 \paragraph{Decimation (frequency downsampling).}
@@ -184,50 +234,7 @@ At the cloud, the decoder reconstructs
 \end{align}
 where $\mathcal{U}_{M/K}$ is an upsampling/interpolation operator restoring the original frequency grid.
 
-\subsection{Bit budget and rate--distortion objective}
-Let $L_{b_s}(t)$ and $L_{b_t}(t)$ denote the number of bits used by the main bitstream and the side information, respectively. The total payload per PSD frame is
-\begin{equation}
-L_b(t) = L_{b_s}(t) + L_{b_t}(t).
-\end{equation}
-We seek to compress the PSD while preserving both waveform-level fidelity and sensing-level decisions derived from the PSD.
-
-A rate--distortion formulation is:
-\begin{equation}
-\min_{\theta,\Phi,\mathcal{E}} \; \mathbb{E}\big[\mathcal{D}(\mathbf{S}_t,\hat{\mathbf{S}}_t)\big]
-\quad \text{s.t.}\quad
-\mathbb{E}[L_b(t)] \le R_{\max},
-\end{equation}
-or equivalently the Lagrangian form:
-\begin{equation}
-\min_{\theta,\Phi,\mathcal{E}} \; \mathbb{E}\Big[\lambda\,\mathcal{D}(\mathbf{S}_t,\hat{\mathbf{S}}_t) + L_b(t)\Big],
-\end{equation}
-where $\lambda>0$ controls the rate--distortion trade-off.
-
-\subsection{Distortion tailored to spectrum sensing}
-Because the cloud ultimately performs sensing on $\hat{\mathbf{S}}_t$, we define $\mathcal{D}$ to penalize errors that matter for monitoring:
-\begin{enumerate}
-\item \textbf{PSD fidelity.} A normalized reconstruction error (often in log-PSD) such as
-\begin{equation}
-\mathcal{D}_{\mathrm{psd}} = \frac{1}{N}\sum_{n=1}^{N} \big(\psi(S_t(\omega_n))-\psi(\hat{S}_t(\omega_n))\big)^2,
-\end{equation}
-with $\psi(\cdot)$ an optional dynamic-range map (e.g., $\log(\epsilon+\cdot)$).
-
-\item \textbf{Occupancy consistency.} Let $O_t(\omega_n)$ and $\hat{O}_t(\omega_n)$ be computed from $S_t$ and $\hat{S}_t$ using the same noise-floor rule. Penalize mismatches, e.g., by a weighted binary cross-entropy (or FP/FN-weighted) loss across frequency bins.
-
-\item \textbf{Feature preservation.} Penalize deviations in sensing features such as peak and centroid:
-\begin{equation}
-\mathcal{D}_{\mathrm{feat}} =
-\alpha_{\mathrm{pk}}|\omega_{\mathrm{pk}}-\hat{\omega}_{\mathrm{pk}}|
-+\alpha_{\mathrm{cent}}|\omega_{\mathrm{cent}}-\hat{\omega}_{\mathrm{cent}}|
-+\alpha_{B}|B_{\mathrm{occ}}-\hat{B}_{\mathrm{occ}}|.
-\end{equation}
-\end{enumerate}
-A practical overall distortion is a weighted sum,
-\begin{equation}
-\mathcal{D} = \beta_{\mathrm{psd}}\mathcal{D}_{\mathrm{psd}} + \beta_{\mathrm{occ}}\mathcal{D}_{\mathrm{occ}} + \beta_{\mathrm{feat}}\mathcal{D}_{\mathrm{feat}}.
-\end{equation}
-
-\subsection{VQ-VAE training losses (codebook and commitment)}
+\subsubsection{VQ-VAE training losses (codebook and commitment)}
 In addition to the rate--distortion objective above, VQ-VAE training typically includes terms that stabilize the discrete bottleneck. Let $\mathrm{sg}[\cdot]$ denote the stop-gradient operator. A common choice is:
 \begin{equation}
 \mathcal{L}_{\mathrm{VQ}} =
@@ -245,5 +252,45 @@ Combining the sensing-aware distortion, the bit budget, and the VQ terms yields 
 + \eta\,\mathbb{E}\big[\mathcal{L}_{\mathrm{VQ}}\big],
 \end{equation}
 with hyperparameters $\lambda,\eta,\beta_{\mathrm{com}}$ and the sensing-aware weights inside $\mathcal{D}$.
+
+
+\subsection{Deterministic compression with FWHT sparsification}
+As an alternative to learned quantization, we consider a deterministic transform coder based on the
+\emph{Fast Walsh--Hadamard Transform (FWHT)}. The method applies the same front-end preprocessing used above
+(decimation, standardization, and the optional non-linear mapping) to obtain $\bm{\sigma}_t\in\mathbb{R}^{N'}$ and
+transmits the corresponding side-information bits $b_t$. The main bitstream $b_s$ is then formed by sparsifying the
+FWHT coefficients of $\bm{\sigma}_t$.
+
+\paragraph{Hadamard transform.}
+Let $N_H$ be a power of two. If $N'$ is not a power of two, we zero-pad $\bm{\sigma}_t$ to length
+$N_H = 2^{\lceil \log_2 N' \rceil}$ (and discard padded bins after inversion). Let $H_{N_H}\in\{\pm1\}^{N_H\times N_H}$
+denote the Hadamard matrix and use the orthonormal transform $\frac{1}{\sqrt{N_H}}H_{N_H}$. The sequency-domain
+coefficients are
+\begin{equation}
+\mathbf{c}_t = \frac{1}{\sqrt{N_H}}\,H_{N_H}\,\bm{\sigma}_t.
+\end{equation}
+
+\paragraph{Top-$K$ sparsification and bitstream $b_s$.}
+Define $\Omega_t$ as the index set of the $K$ largest-magnitude coefficients of $\mathbf{c}_t$.
+We form a sparse vector $\tilde{\mathbf{c}}_t$ such that $(\tilde{\mathbf{c}}_t)_i = (\mathbf{c}_t)_i$ for $i\in\Omega_t$
+and zero otherwise. The transmitted payload $b_s$ contains (i) the locations $\Omega_t$ (e.g., as an index list or a bitmask)
+and (ii) quantized coefficient values $\mathcal{Q}((\mathbf{c}_t)_i)$ for $i\in\Omega_t$.
+In practice, $\Omega_t$ can be computed efficiently without a full sort (e.g., via selection algorithms such as Quickselect).
+
+\paragraph{Reconstruction.}
+The cloud reconstructs the transformed PSD by the inverse FWHT:
+\begin{equation}
+\hat{\bm{\sigma}}_t = \frac{1}{\sqrt{N_H}}\,H_{N_H}\,\tilde{\mathbf{c}}_t,
+\end{equation}
+and then applies the same inverse processing as before using $b_t$:
+$\hat{\mathbf{s}}_t=g_{\mathrm{nl}}^{-1}(\hat{\bm{\sigma}}_t)$,
+$\hat{\mathbf{S}}'_t=\mathrm{DeStd}(\hat{\mathbf{s}}_t;\mathbf{t}_t)$,
+and $\hat{\mathbf{S}}_t=\mathcal{U}_{M/K}(\hat{\mathbf{S}}'_t)$.
+
+\paragraph{Complexity and operating point.}
+FWHT has $\mathcal{O}(N_H\log N_H)$ time complexity and uses only additions/subtractions.
+The rate--distortion trade-off is controlled mainly by $K$ and the coefficient quantizer $\mathcal{Q}(\cdot)$,
+with no training required.
+
 
 \end{document}
