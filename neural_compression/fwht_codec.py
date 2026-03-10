@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import csv
 import math
+import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -22,6 +23,18 @@ import pandas as pd  # type: ignore[import-untyped]
 FLOAT32_BITS = 32
 LENGTH_BITS = 16
 MIN_LINEAR_POWER = 1e-30
+SERIALIZATION_MAGIC = b"FWHT"
+SERIALIZATION_VERSION = 1
+SERIALIZATION_FLAG_HAS_SCALE = 1 << 0
+MAX_LENGTH_VALUE = (1 << LENGTH_BITS) - 1
+HEADER_FORMAT = "<4sBBBBBHHHHHff"
+HEADER_SIZE_BYTES = struct.calcsize(HEADER_FORMAT)
+NONLINEAR_MAP_CODES = {"identity": 0, "asinh": 1}
+AGGREGATION_DOMAIN_CODES = {"db": 0, "linear_power": 1}
+NONLINEAR_MAP_FROM_CODE = {code: name for name, code in NONLINEAR_MAP_CODES.items()}
+AGGREGATION_DOMAIN_FROM_CODE = {
+    code: name for name, code in AGGREGATION_DOMAIN_CODES.items()
+}
 
 
 @dataclass(frozen=True)
@@ -81,10 +94,14 @@ class FWHTCodecConfig:
         """Validate codec hyperparameters that define the operating point."""
         if self.decimation_factor < 1:
             raise ValueError("decimation_factor must be at least one.")
+        if self.decimation_factor > MAX_LENGTH_VALUE:
+            raise ValueError(f"decimation_factor must fit inside {LENGTH_BITS} bits.")
         if self.retained_coefficients < 0:
             raise ValueError("retained_coefficients must be non-negative.")
         if self.quantization_bits < 1:
             raise ValueError("quantization_bits must be at least one.")
+        if self.quantization_bits > 32:
+            raise ValueError("quantization_bits must not exceed 32.")
         if self.nonlinear_map not in {"identity", "asinh"}:
             raise ValueError("nonlinear_map must be 'identity' or 'asinh'.")
         if self.aggregation_domain not in {"db", "linear_power"}:
@@ -493,22 +510,33 @@ def dequantize_symmetric_uniform(
 
 def validate_payload(
     payload: EncodedFWHTPayload,  # Candidate FWHT payload
+    codec_config: FWHTCodecConfig,  # Codec contract used to interpret the payload
 ) -> None:
     """Validate the payload invariants required by the decoder."""
     if payload.retained_indices.ndim != 1:
         raise ValueError("retained_indices must be one-dimensional.")
+    if not np.issubdtype(payload.retained_indices.dtype, np.integer):
+        raise ValueError("retained_indices must use an integer dtype.")
     if payload.quantization.quantized_levels.ndim != 1:
         raise ValueError("quantized_levels must be one-dimensional.")
+    if not np.issubdtype(payload.quantization.quantized_levels.dtype, np.integer):
+        raise ValueError("quantized_levels must use an integer dtype.")
     if payload.retained_indices.size != payload.quantization.quantized_levels.size:
         raise ValueError(
             "retained_indices and quantized_levels must contain the same number of entries."
         )
     if payload.stats.original_length < 1:
         raise ValueError("original_length must be positive.")
+    if payload.stats.original_length > MAX_LENGTH_VALUE:
+        raise ValueError(f"original_length must fit inside {LENGTH_BITS} bits.")
     if payload.stats.decimated_length < 1:
         raise ValueError("decimated_length must be positive.")
+    if payload.stats.decimated_length > MAX_LENGTH_VALUE:
+        raise ValueError(f"decimated_length must fit inside {LENGTH_BITS} bits.")
     if payload.stats.padded_length < payload.stats.decimated_length:
         raise ValueError("padded_length must be at least decimated_length.")
+    if payload.stats.padded_length > MAX_LENGTH_VALUE:
+        raise ValueError(f"padded_length must fit inside {LENGTH_BITS} bits.")
     if payload.stats.padded_length & (payload.stats.padded_length - 1):
         raise ValueError("padded_length must be a power of two.")
     if not math.isfinite(payload.stats.mean_level):
@@ -517,8 +545,37 @@ def validate_payload(
         raise ValueError("std_level must be finite and strictly positive.")
     if not math.isfinite(payload.quantization.coefficient_scale):
         raise ValueError("coefficient_scale must be finite.")
+    if payload.quantization.coefficient_scale < 0.0:
+        raise ValueError("coefficient_scale must be non-negative.")
+    if payload.retained_indices.size > MAX_LENGTH_VALUE:
+        raise ValueError(
+            f"retained coefficient count must fit inside {LENGTH_BITS} bits."
+        )
+    if payload.retained_indices.size > payload.stats.padded_length:
+        raise ValueError("retained coefficient count must not exceed padded_length.")
+
+    expected_decimated_length = compute_block_layout(
+        payload.stats.original_length,
+        codec_config.decimation_factor,
+    )[0].size
+    if payload.stats.decimated_length != expected_decimated_length:
+        raise ValueError(
+            "decimated_length is inconsistent with original_length and decimation_factor."
+        )
+    if payload.stats.padded_length != next_power_of_two(payload.stats.decimated_length):
+        raise ValueError("padded_length is inconsistent with decimated_length.")
+
+    quantization_levels = max(1, (1 << (codec_config.quantization_bits - 1)) - 1)
+    if np.any(np.abs(payload.quantization.quantized_levels) > quantization_levels):
+        raise ValueError(
+            "quantized_levels exceed the valid range for quantization_bits."
+        )
     if payload.retained_indices.size == 0:
         return
+    if payload.quantization.coefficient_scale <= 0.0:
+        raise ValueError(
+            "coefficient_scale must be strictly positive when retained coefficients are present."
+        )
 
     if int(payload.retained_indices[0]) < 0:
         raise ValueError("retained_indices must be non-negative.")
@@ -530,12 +587,172 @@ def validate_payload(
         raise ValueError("retained_indices must be strictly increasing and unique.")
 
 
+def quantized_level_dtype(
+    quantization_bits: int,  # Signed quantizer precision [bits]
+) -> np.dtype:
+    """Return the smallest signed integer dtype that can store the quantized levels."""
+    if quantization_bits < 1 or quantization_bits > 32:
+        raise ValueError("quantization_bits must lie in [1, 32].")
+    if quantization_bits <= 8:
+        return np.dtype("<i1")
+    if quantization_bits <= 16:
+        return np.dtype("<i2")
+    return np.dtype("<i4")
+
+
+def serialize_payload(
+    payload: EncodedFWHTPayload,  # Payload to serialize
+    codec_config: FWHTCodecConfig,  # Codec contract that defines field widths
+) -> bytes:
+    """Serialize a validated FWHT payload into a versioned little-endian byte packet."""
+    validate_payload(payload, codec_config)
+
+    retained_count = payload.retained_indices.size
+    has_scale = retained_count > 0
+    flags = SERIALIZATION_FLAG_HAS_SCALE if has_scale else 0
+    header_bytes = struct.pack(
+        HEADER_FORMAT,
+        SERIALIZATION_MAGIC,
+        SERIALIZATION_VERSION,
+        flags,
+        NONLINEAR_MAP_CODES[codec_config.nonlinear_map],
+        AGGREGATION_DOMAIN_CODES[codec_config.aggregation_domain],
+        codec_config.quantization_bits,
+        codec_config.decimation_factor,
+        payload.stats.original_length,
+        payload.stats.decimated_length,
+        payload.stats.padded_length,
+        retained_count,
+        payload.stats.mean_level,
+        payload.stats.std_level,
+    )
+
+    scale_bytes = b""
+    if has_scale:
+        scale_bytes = struct.pack("<f", payload.quantization.coefficient_scale)
+
+    index_bytes = payload.retained_indices.astype("<u2", copy=False).tobytes()
+    level_dtype = quantized_level_dtype(codec_config.quantization_bits)
+    level_bytes = payload.quantization.quantized_levels.astype(
+        level_dtype,
+        copy=False,
+    ).tobytes()
+    return header_bytes + scale_bytes + index_bytes + level_bytes
+
+
+def deserialize_payload(
+    blob: bytes | bytearray | memoryview,  # Serialized FWHT packet
+    codec_config: FWHTCodecConfig,  # Codec contract expected by the receiver
+) -> EncodedFWHTPayload:
+    """Deserialize a versioned FWHT packet into a validated payload object."""
+    packet = bytes(blob)
+    if len(packet) < HEADER_SIZE_BYTES:
+        raise ValueError("Serialized payload is shorter than the FWHT header.")
+
+    (
+        magic,
+        version,
+        flags,
+        nonlinear_code,
+        aggregation_code,
+        quantization_bits,
+        decimation_factor,
+        original_length,
+        decimated_length,
+        padded_length,
+        retained_count,
+        mean_level,
+        std_level,
+    ) = struct.unpack_from(HEADER_FORMAT, packet, 0)
+    if magic != SERIALIZATION_MAGIC:
+        raise ValueError("Serialized payload has an invalid magic prefix.")
+    if version != SERIALIZATION_VERSION:
+        raise ValueError("Serialized payload uses an unsupported version.")
+    if flags & ~SERIALIZATION_FLAG_HAS_SCALE:
+        raise ValueError("Serialized payload uses unsupported header flags.")
+    if nonlinear_code not in NONLINEAR_MAP_FROM_CODE:
+        raise ValueError("Serialized payload uses an unknown nonlinear map code.")
+    if aggregation_code not in AGGREGATION_DOMAIN_FROM_CODE:
+        raise ValueError("Serialized payload uses an unknown aggregation domain code.")
+    if NONLINEAR_MAP_FROM_CODE[nonlinear_code] != codec_config.nonlinear_map:
+        raise ValueError(
+            "Serialized payload nonlinear map does not match codec_config."
+        )
+    if (
+        AGGREGATION_DOMAIN_FROM_CODE[aggregation_code]
+        != codec_config.aggregation_domain
+    ):
+        raise ValueError(
+            "Serialized payload aggregation domain does not match codec_config."
+        )
+    if quantization_bits != codec_config.quantization_bits:
+        raise ValueError(
+            "Serialized payload quantization_bits does not match codec_config."
+        )
+    if decimation_factor != codec_config.decimation_factor:
+        raise ValueError(
+            "Serialized payload decimation_factor does not match codec_config."
+        )
+
+    offset = HEADER_SIZE_BYTES
+    coefficient_scale = 0.0
+    if flags & SERIALIZATION_FLAG_HAS_SCALE:
+        scale_end = offset + FLOAT32_BITS // 8
+        if len(packet) < scale_end:
+            raise ValueError(
+                "Serialized payload is truncated before coefficient_scale."
+            )
+        (coefficient_scale,) = struct.unpack_from("<f", packet, offset)
+        offset = scale_end
+    elif retained_count > 0:
+        raise ValueError(
+            "Serialized payload omitted coefficient_scale despite carrying retained coefficients."
+        )
+
+    index_end = offset + retained_count * (LENGTH_BITS // 8)
+    if len(packet) < index_end:
+        raise ValueError("Serialized payload is truncated before retained_indices.")
+    retained_indices = np.frombuffer(
+        packet[offset:index_end],
+        dtype="<u2",
+    ).astype(np.int32)
+    offset = index_end
+
+    level_dtype = quantized_level_dtype(codec_config.quantization_bits)
+    level_end = offset + retained_count * level_dtype.itemsize
+    if len(packet) != level_end:
+        raise ValueError(
+            "Serialized payload length is inconsistent with the header metadata."
+        )
+    quantized_levels = np.frombuffer(
+        packet[offset:level_end],
+        dtype=level_dtype,
+    ).astype(np.int32)
+
+    payload = EncodedFWHTPayload(
+        retained_indices=retained_indices,
+        quantization=QuantizationState(
+            quantized_levels=quantized_levels,
+            coefficient_scale=float(coefficient_scale),
+        ),
+        stats=StandardizationStats(
+            mean_level=float(mean_level),
+            std_level=float(std_level),
+            original_length=int(original_length),
+            decimated_length=int(decimated_length),
+            padded_length=int(padded_length),
+        ),
+    )
+    validate_payload(payload, codec_config)
+    return payload
+
+
 def materialize_sparse_coefficients(
     payload: EncodedFWHTPayload,
     codec_config: FWHTCodecConfig,
 ) -> np.ndarray:
     """Rebuild the sparse Hadamard-domain vector from the transmitted payload only."""
-    validate_payload(payload)
+    validate_payload(payload, codec_config)
 
     sparse_coefficients = np.zeros(payload.stats.padded_length, dtype=np.float64)
     if payload.retained_indices.size == 0:
@@ -613,10 +830,13 @@ def encode_fwht_frame(
 
 
 def decode_fwht_frame(
-    payload: EncodedFWHTPayload,
+    payload: EncodedFWHTPayload | bytes | bytearray | memoryview,
     codec_config: FWHTCodecConfig,
 ) -> np.ndarray:
     """Decode an FWHT payload back onto the original PSD grid."""
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        payload = deserialize_payload(payload, codec_config)
+
     sparse_coefficients = materialize_sparse_coefficients(payload, codec_config)
     transformed_signal = fwht_orthonormal(sparse_coefficients)[
         : payload.stats.decimated_length
@@ -643,22 +863,7 @@ def estimate_payload_bits(
     codec_config: FWHTCodecConfig,
 ) -> int:
     """Estimate the transmitted payload bits for the current encoded frame."""
-    validate_payload(payload)
-
-    if payload.retained_indices.size > 0 and payload.stats.padded_length > 1:
-        index_bits = payload.retained_indices.size * math.ceil(
-            math.log2(payload.stats.padded_length)
-        )
-    else:
-        index_bits = 0
-
-    value_bits = payload.retained_indices.size * codec_config.quantization_bits
-
-    # The payload transmits float32 side information and fixed-width shape metadata.
-    side_bits = 3 * LENGTH_BITS + 2 * FLOAT32_BITS
-    if payload.retained_indices.size > 0:
-        side_bits += FLOAT32_BITS
-    return int(index_bits + value_bits + side_bits)
+    return len(serialize_payload(payload, codec_config)) * 8
 
 
 def reconstruct_fwht_frame(
@@ -667,7 +872,8 @@ def reconstruct_fwht_frame(
 ) -> tuple[EncodedFWHTPayload, FWHTEncodeDiagnostics, np.ndarray]:
     """Run the full FWHT encode/decode loop for one frame."""
     payload, diagnostics = encode_fwht_frame(frame, codec_config)
-    reconstructed_psd_db = decode_fwht_frame(payload, codec_config)
+    payload_bytes = serialize_payload(payload, codec_config)
+    reconstructed_psd_db = decode_fwht_frame(payload_bytes, codec_config)
     return payload, diagnostics, reconstructed_psd_db
 
 
@@ -942,16 +1148,26 @@ def select_representative_frame(
 
 
 __all__ = [
+    "AGGREGATION_DOMAIN_CODES",
+    "AGGREGATION_DOMAIN_FROM_CODE",
     "DatasetConfig",
     "EncodedFWHTPayload",
     "FWHTCodecConfig",
     "FWHTEncodeDiagnostics",
     "FLOAT32_BITS",
     "FrameMetrics",
+    "HEADER_FORMAT",
+    "HEADER_SIZE_BYTES",
     "LENGTH_BITS",
+    "MAX_LENGTH_VALUE",
+    "NONLINEAR_MAP_CODES",
+    "NONLINEAR_MAP_FROM_CODE",
     "OccupancyComponent",
     "PsdFrame",
     "QuantizationState",
+    "SERIALIZATION_FLAG_HAS_SCALE",
+    "SERIALIZATION_MAGIC",
+    "SERIALIZATION_VERSION",
     "StandardizationStats",
     "apply_nonlinear_map",
     "block_center_positions",
@@ -962,6 +1178,7 @@ __all__ = [
     "decode_fwht_frame",
     "decimate_psd",
     "dequantize_symmetric_uniform",
+    "deserialize_payload",
     "destandardize_values",
     "encode_fwht_frame",
     "estimate_noise_floor_db",
@@ -976,10 +1193,12 @@ __all__ = [
     "next_power_of_two",
     "occupancy_mask",
     "parse_psd_values",
+    "quantized_level_dtype",
     "quantize_float32_scalar",
     "quantize_symmetric_uniform",
     "reconstruct_fwht_frame",
     "select_representative_frame",
+    "serialize_payload",
     "spectral_centroid_hz",
     "spectral_peak_frequency_hz",
     "standardize_values",

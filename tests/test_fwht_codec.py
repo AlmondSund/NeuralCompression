@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 from pathlib import Path
 
@@ -11,18 +12,23 @@ from neural_compression.fwht_codec import (
     DatasetConfig,
     EncodedFWHTPayload,
     FWHTCodecConfig,
+    HEADER_SIZE_BYTES,
+    LENGTH_BITS,
+    MAX_LENGTH_VALUE,
     PsdFrame,
     QuantizationState,
     compute_block_layout,
     compute_frame_metrics,
     compute_standardization_stats,
     decode_fwht_frame,
+    deserialize_payload,
     decimate_psd,
     encode_fwht_frame,
     estimate_payload_bits,
     fwht_orthonormal,
     make_frequency_axis_hz,
     materialize_sparse_coefficients,
+    serialize_payload,
     total_occupied_bandwidth_hz,
 )
 
@@ -62,8 +68,8 @@ class FWHTKernelTests(unittest.TestCase):
 class FWHTPayloadTests(unittest.TestCase):
     """Tests for payload-only reconstruction and rate accounting."""
 
-    def test_payload_roundtrip_uses_quantized_side_information(self) -> None:
-        """The payload must reconstruct only from transmitted indices, levels, and float32 side info."""
+    def test_packet_roundtrip_uses_quantized_side_information(self) -> None:
+        """Serialized packets must preserve the quantized payload and decode correctly."""
         frame = make_synthetic_frame(
             np.array(
                 [
@@ -89,7 +95,9 @@ class FWHTPayloadTests(unittest.TestCase):
         )
 
         payload, diagnostics = encode_fwht_frame(frame, codec_config)
-        reconstructed_psd_db = decode_fwht_frame(payload, codec_config)
+        packet = serialize_payload(payload, codec_config)
+        deserialized_payload = deserialize_payload(packet, codec_config)
+        reconstructed_psd_db = decode_fwht_frame(packet, codec_config)
 
         decimated_psd_db = decimate_psd(
             frame.psd_db,
@@ -106,9 +114,22 @@ class FWHTPayloadTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(payload.stats.mean_level, expected_stats.mean_level)
-        self.assertEqual(payload.stats.std_level, expected_stats.std_level)
-        self.assertEqual(payload.quantization.coefficient_scale, expected_scale)
+        np.testing.assert_array_equal(
+            deserialized_payload.retained_indices,
+            payload.retained_indices,
+        )
+        np.testing.assert_array_equal(
+            deserialized_payload.quantization.quantized_levels,
+            payload.quantization.quantized_levels,
+        )
+        self.assertEqual(
+            deserialized_payload.stats.mean_level, expected_stats.mean_level
+        )
+        self.assertEqual(deserialized_payload.stats.std_level, expected_stats.std_level)
+        self.assertEqual(
+            deserialized_payload.quantization.coefficient_scale,
+            expected_scale,
+        )
         self.assertEqual(reconstructed_psd_db.shape[0], frame.psd_db.size)
 
     def test_decoder_rejects_duplicate_indices(self) -> None:
@@ -128,8 +149,8 @@ class FWHTPayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             materialize_sparse_coefficients(bad_payload, codec_config)
 
-    def test_payload_bit_estimate_matches_the_codec_contract(self) -> None:
-        """Rate accounting must include side information and bit-packed retained indices."""
+    def test_payload_bit_estimate_matches_the_serialized_packet_length(self) -> None:
+        """Rate accounting must equal the exact serialized packet length in bits."""
         frame = make_synthetic_frame(np.linspace(-80.0, -30.0, 16))
         codec_config = FWHTCodecConfig(
             decimation_factor=2,
@@ -138,14 +159,60 @@ class FWHTPayloadTests(unittest.TestCase):
             aggregation_domain="db",
         )
         payload, _ = encode_fwht_frame(frame, codec_config)
+        packet = serialize_payload(payload, codec_config)
 
-        index_bits = 4 * 3
-        value_bits = 4 * 8
-        side_bits = 3 * 16 + 2 * 32 + 32
+        expected_bits = HEADER_SIZE_BYTES * 8 + 4 * LENGTH_BITS + 4 * 8 + 32
         self.assertEqual(
             estimate_payload_bits(payload, codec_config),
-            index_bits + value_bits + side_bits,
+            expected_bits,
         )
+        self.assertEqual(estimate_payload_bits(payload, codec_config), len(packet) * 8)
+
+    def test_deserializer_rejects_corrupted_magic(self) -> None:
+        """Malformed packets must fail before decode when the transport header is corrupted."""
+        frame = make_synthetic_frame(np.linspace(-80.0, -30.0, 16))
+        codec_config = FWHTCodecConfig(
+            decimation_factor=2,
+            retained_coefficients=4,
+            quantization_bits=8,
+        )
+        payload, _ = encode_fwht_frame(frame, codec_config)
+        corrupted_packet = bytearray(serialize_payload(payload, codec_config))
+        corrupted_packet[0:4] = b"NOPE"
+
+        with self.assertRaises(ValueError):
+            deserialize_payload(corrupted_packet, codec_config)
+
+    def test_serializer_rejects_metadata_overflow(self) -> None:
+        """Metadata that does not fit the fixed-width transport fields must be rejected."""
+        frame = make_synthetic_frame(np.linspace(-75.0, -35.0, 8))
+        codec_config = FWHTCodecConfig(retained_coefficients=3, quantization_bits=6)
+        payload, _ = encode_fwht_frame(frame, codec_config)
+        overflowing_payload = EncodedFWHTPayload(
+            retained_indices=payload.retained_indices,
+            quantization=payload.quantization,
+            stats=replace(payload.stats, original_length=MAX_LENGTH_VALUE + 1),
+        )
+
+        with self.assertRaises(ValueError):
+            serialize_payload(overflowing_payload, codec_config)
+
+    def test_serializer_rejects_quantized_levels_outside_bit_depth(self) -> None:
+        """Quantized levels outside the configured signed range must be rejected."""
+        frame = make_synthetic_frame(np.linspace(-75.0, -35.0, 8))
+        codec_config = FWHTCodecConfig(retained_coefficients=3, quantization_bits=6)
+        payload, _ = encode_fwht_frame(frame, codec_config)
+        bad_payload = EncodedFWHTPayload(
+            retained_indices=payload.retained_indices,
+            quantization=QuantizationState(
+                quantized_levels=np.array([40, 1, -1], dtype=np.int32),
+                coefficient_scale=payload.quantization.coefficient_scale,
+            ),
+            stats=payload.stats,
+        )
+
+        with self.assertRaises(ValueError):
+            serialize_payload(bad_payload, codec_config)
 
 
 class SensingMetricTests(unittest.TestCase):
